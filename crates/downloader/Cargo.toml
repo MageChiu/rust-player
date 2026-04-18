@@ -1,0 +1,12 @@
+[package]
+name = "downloader"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+dioxus.workspace = true
+dirs.workspace = true
+futures-util.workspace = true
+librqbit.workspace = true
+tokio.workspace = true

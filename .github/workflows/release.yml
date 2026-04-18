@@ -1,0 +1,168 @@
+name: Release Builds
+
+on:
+  push:
+    tags:
+      - 'v*' # Trigger workflow on version tags, e.g., v1.0.0
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  build-macos:
+    name: Build macOS (${{ matrix.target }})
+    runs-on: macos-13
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            arch_name: intel
+          - target: aarch64-apple-darwin
+            arch_name: arm64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install dependencies
+        run: |
+          brew update
+          brew install ffmpeg@6 dylibbundler
+
+      - name: Build Application
+        run: |
+          export FFMPEG_DIR=$(brew --prefix ffmpeg@6)
+          export PKG_CONFIG_PATH="$FFMPEG_DIR/lib/pkgconfig:$PKG_CONFIG_PATH"
+          
+          # For aarch64 cross-compilation on macOS x86_64 runner, or native builds
+          if [ "${{ matrix.target }}" == "aarch64-apple-darwin" ]; then
+            export BINDGEN_EXTRA_CLANG_ARGS="-isysroot $(xcrun --show-sdk-path) -target arm64-apple-macos"
+          else
+            export BINDGEN_EXTRA_CLANG_ARGS="-isysroot $(xcrun --show-sdk-path) -target x86_64-apple-macos"
+          fi
+
+          cargo build --release -p rust-player --target ${{ matrix.target }}
+
+      - name: Package macOS App Bundle
+        run: |
+          export APP_NAME="RustPlayer"
+          export APP_DIR="dist/${APP_NAME}.app"
+          export CONTENTS_DIR="${APP_DIR}/Contents"
+          export MACOS_DIR="${CONTENTS_DIR}/MacOS"
+          export FRAMEWORKS_DIR="${CONTENTS_DIR}/Frameworks"
+          export RESOURCES_DIR="${CONTENTS_DIR}/Resources"
+
+          mkdir -p "${MACOS_DIR}" "${FRAMEWORKS_DIR}" "${RESOURCES_DIR}"
+
+          # Create Info.plist
+          cat << EOF > "${CONTENTS_DIR}/Info.plist"
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleDevelopmentRegion</key><string>en</string>
+              <key>CFBundleExecutable</key><string>rust-player</string>
+              <key>CFBundleIdentifier</key><string>com.rust-player.app</string>
+              <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+              <key>CFBundleName</key><string>${APP_NAME}</string>
+              <key>CFBundlePackageType</key><string>APPL</string>
+              <key>CFBundleShortVersionString</key><string>1.0</string>
+              <key>CFBundleVersion</key><string>1</string>
+              <key>LSMinimumSystemVersion</key><string>10.13</string>
+              <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+
+          # Copy executable
+          cp "target/${{ matrix.target }}/release/rust-player" "${MACOS_DIR}/"
+
+          # Bundle dependencies using dylibbundler
+          dylibbundler -x "${MACOS_DIR}/rust-player" -b -d "${FRAMEWORKS_DIR}" -p "@executable_path/../Frameworks" -cd -of -s /usr/local/lib -s /opt/homebrew/lib -s /usr/local/opt/ffmpeg@6/lib
+
+          # Create a compressed zip archive
+          cd dist
+          zip -r -y RustPlayer-macOS-${{ matrix.arch_name }}.zip "${APP_NAME}.app"
+
+      - name: Upload macOS Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RustPlayer-macOS-${{ matrix.arch_name }}
+          path: dist/RustPlayer-macOS-${{ matrix.arch_name }}.zip
+
+
+  build-windows:
+    name: Build Windows (x86_64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install vcpkg and FFmpeg
+        run: |
+          # The ffmpeg-sys-the-third crate handles Windows build well via vcpkg
+          # Or we can just use the built-in auto-download if we enable vcpkg feature, 
+          # but downloading pre-compiled ffmpeg dev libraries for Windows is safer.
+          Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n6.1-latest-win64-gpl-shared-6.1.zip" -OutFile "ffmpeg.zip"
+          Expand-Archive -Path "ffmpeg.zip" -DestinationPath "C:\ffmpeg"
+          $ffmpeg_dir = (Get-ChildItem -Path "C:\ffmpeg" -Directory)[0].FullName
+          echo "FFMPEG_DIR=$ffmpeg_dir" >> $env:GITHUB_ENV
+          # Add bin to path for running/packaging
+          echo "$ffmpeg_dir\bin" >> $env:GITHUB_PATH
+
+      - name: Build Application
+        run: |
+          # On Windows we need to disable the `build` feature from ffmpeg-the-third to link dynamically
+          # or ensure the path is correctly set.
+          cargo build --release -p rust-player
+
+      - name: Package Windows Release
+        run: |
+          mkdir dist
+          mkdir dist\RustPlayer
+          # Copy executable
+          cp target\release\rust-player.exe dist\RustPlayer\
+          
+          # Copy FFmpeg DLLs
+          cp $env:FFMPEG_DIR\bin\*.dll dist\RustPlayer\
+          
+          cd dist
+          Compress-Archive -Path RustPlayer -DestinationPath RustPlayer-Windows-x86_64.zip
+
+      - name: Upload Windows Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RustPlayer-Windows-x86_64
+          path: dist/RustPlayer-Windows-x86_64.zip
+
+  release:
+    name: Create GitHub Release
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/RustPlayer-macOS-intel/RustPlayer-macOS-intel.zip
+            artifacts/RustPlayer-macOS-arm64/RustPlayer-macOS-arm64.zip
+            artifacts/RustPlayer-Windows-x86_64/RustPlayer-Windows-x86_64.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
